@@ -1,0 +1,343 @@
+import os
+import numpy as np
+import torch
+from scipy.signal import correlate
+import warnings
+warnings.filterwarnings('ignore')
+import os
+import sys
+
+# 获取项目根目录路径
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, project_root)
+
+from configs.config import Config, config
+from data.university_of_ottawa_loader import UniversityOfOttawaDataLoader
+
+
+class DataPreprocessor:
+    """数据预处理器"""
+    def __init__(self, config):
+        self.config = config
+        print("数据预处理器初始化完成")
+
+    def time_alignment(self, accelerometer_1_signal, microphone_signal, accelerometer_2_signal, accelerometer_3_signal, temperature_signal):
+        """基于互相关的多信号时间对齐"""
+        # 定义辅助函数进行两个信号的对齐
+        def align_two_signals(signal1, signal2):
+            correlation = correlate(signal1, signal2, mode='full')
+            delay = np.argmax(correlation) - len(signal2) + 1
+            
+            if delay > 0:
+                aligned_signal1 = signal1[delay:]
+                aligned_signal2 = signal2[:len(signal1)-delay]
+            elif delay < 0:
+                aligned_signal1 = signal1[:len(signal1)+delay]
+                aligned_signal2 = signal2[-delay:]
+            else:
+                aligned_signal1 = signal1
+                aligned_signal2 = signal2
+            
+            min_length = min(len(aligned_signal1), len(aligned_signal2))
+            return aligned_signal1[:min_length], aligned_signal2[:min_length]
+
+        # 使用第一个信号作为参考基准
+        reference_signal = accelerometer_1_signal
+
+        # 对其他信号与参考信号进行对齐
+        microphone_aligned, accelerometer_1_aligned = align_two_signals(microphone_signal, reference_signal)
+        accelerometer_2_aligned, _ = align_two_signals(accelerometer_2_signal, reference_signal)
+        accelerometer_3_aligned, _ = align_two_signals(accelerometer_3_signal, reference_signal)
+        temperature_aligned, _ = align_two_signals(temperature_signal, reference_signal)
+
+        # 确保所有信号长度一致
+        min_length = min(
+            len(microphone_aligned), 
+            len(accelerometer_1_aligned),
+            len(accelerometer_2_aligned), 
+            len(accelerometer_3_aligned), 
+            len(temperature_aligned)
+        )
+
+        return (
+            accelerometer_1_aligned[:min_length], 
+            microphone_aligned[:min_length], 
+            accelerometer_2_aligned[:min_length], 
+            accelerometer_3_aligned[:min_length], 
+            temperature_aligned[:min_length]
+        )
+
+
+    def normalize_signal(self, signal):
+        """零均值化和方差归一化"""
+        # 零均值化
+        signal_mean = np.mean(signal)
+        signal_centered = signal - signal_mean
+        
+        # 方差归一化
+        signal_std = np.std(signal_centered)
+        if signal_std > 0:
+            signal_normalized = signal_centered / signal_std
+        else:
+            signal_normalized = signal_centered
+        
+        return signal_normalized
+
+    def segment_signal(self, signal, window_size=None, overlap_ratio=0.5):
+        """信号分段处理"""
+        if window_size is None:
+            window_size = self.config.SIGNAL_LENGTH
+        
+        if len(signal) <= window_size:
+            # 如果信号长度不足，进行零填充
+            padded_signal = np.zeros(window_size)
+            padded_signal[:len(signal)] = signal
+            return [padded_signal]
+        
+        # 计算步长
+        step = int(window_size * (1 - overlap_ratio))
+        segments = []
+        
+        for i in range(0, len(signal) - window_size + 1, step):
+            segment = signal[i:i + window_size]
+            segments.append(segment)
+        
+        return segments
+
+    def data_augmentation(self, signal, augment_type='gaussian_noise'):
+        """数据增强策略"""
+        if augment_type == 'gaussian_noise':
+            # 添加高斯噪声
+            snr_db = np.random.choice([20, 30, 40])  # 随机选择信噪比
+            signal_power = np.mean(signal ** 2)
+            snr_linear = 10 ** (snr_db / 10)
+            noise_power = signal_power / snr_linear
+            noise = np.random.normal(0, np.sqrt(noise_power), signal.shape)
+            return signal + noise
+        
+        elif augment_type == 'time_shift':
+            # 时间窗口滑动
+            shift_range = self.config.TIME_SHIFT_RANGE
+            shift = np.random.randint(shift_range[0], shift_range[1])
+            return np.roll(signal, shift)
+        
+        elif augment_type == 'amplitude_scaling':
+            # 幅值缩放
+            scale_range = self.config.AMPLITUDE_RANGE
+            scale = np.random.uniform(scale_range[0], scale_range[1])
+            return signal * scale
+        
+        else:
+            return signal
+
+    def process_sample(self, data_sample, apply_augmentation=False):
+            """处理单个样本"""
+            # 提取所有信号
+            accelerometer_1_signal = data_sample['accelerometer_1']  # 第0列，振动信号
+            microphone_signal = data_sample['microphone']  # 第1列，音频信号
+            accelerometer_2_signal = data_sample['accelerometer_2']  # 第2列 振动信号
+            accelerometer_3_signal = data_sample['accelerometer_3']  # 第3列 振动信号
+            temperature_signal = data_sample['temperature']  # 第4列，温度
+
+            # 保证所有信号长度一致
+            min_length = min(
+                len(accelerometer_1_signal),
+                len(microphone_signal),
+                len(accelerometer_2_signal),
+                len(accelerometer_3_signal),
+                len(temperature_signal)
+            )
+
+            # 截取一致长度的信号
+            accelerometer_1_signal = accelerometer_1_signal[:min_length]
+            microphone_signal = microphone_signal[:min_length]
+            accelerometer_2_signal = accelerometer_2_signal[:min_length]
+            accelerometer_3_signal = accelerometer_3_signal[:min_length]
+            temperature_signal = temperature_signal[:min_length]
+
+            # 信号标准化
+            accelerometer_1_normalized = self.normalize_signal(accelerometer_1_signal)
+            microphone_normalized = self.normalize_signal(microphone_signal)
+            accelerometer_2_normalized = self.normalize_signal(accelerometer_2_signal)
+            accelerometer_3_normalized = self.normalize_signal(accelerometer_3_signal)
+            temperature_normalized = self.normalize_signal(temperature_signal)
+
+            # 信号分段
+            accelerometer_1_segments = self.segment_signal(
+                accelerometer_1_normalized,  
+                self.config.SIGNAL_LENGTH,  
+                self.config.OVERLAP_RATIO
+            )
+            microphone_segments = self.segment_signal(
+                microphone_normalized,  
+                self.config.SIGNAL_LENGTH,  
+                self.config.OVERLAP_RATIO
+            )
+            accelerometer_2_segments = self.segment_signal(
+                accelerometer_2_normalized,  
+                self.config.SIGNAL_LENGTH,  
+                self.config.OVERLAP_RATIO
+            )
+            accelerometer_3_segments = self.segment_signal(
+                accelerometer_3_normalized,  
+                self.config.SIGNAL_LENGTH,  
+                self.config.OVERLAP_RATIO
+            )
+            temperature_segments = self.segment_signal(
+                temperature_normalized,  
+                self.config.SIGNAL_LENGTH,  
+                self.config.OVERLAP_RATIO
+            )
+
+            # 确保所有信号的分段数量一致
+            min_segments = min(
+                len(accelerometer_1_segments),
+                len(microphone_segments),
+                len(accelerometer_2_segments),
+                len(accelerometer_3_segments),
+                len(temperature_segments)
+            )
+
+            accelerometer_1_segments = accelerometer_1_segments[:min_segments]
+            microphone_segments = microphone_segments[:min_segments]
+            accelerometer_2_segments = accelerometer_2_segments[:min_segments]
+            accelerometer_3_segments = accelerometer_3_segments[:min_segments]
+            temperature_segments = temperature_segments[:min_segments]
+
+            # 数据增强
+            if apply_augmentation:
+                augmented_signals = {
+                    'accelerometer_1': [],
+                    'microphone': [],
+                    'accelerometer_2': [],
+                    'accelerometer_3': [],
+                    'temperature': []
+                }
+                
+                for i in range(min_segments):
+                    for signal_name, segments in [
+                        ('accelerometer_1', accelerometer_1_segments),
+                        ('microphone', microphone_segments),
+                        ('accelerometer_2', accelerometer_2_segments),
+                        ('accelerometer_3', accelerometer_3_segments),
+                        ('temperature', temperature_segments)
+                    ]:
+                        if np.random.rand() < self.config.AUGMENT_PROB:
+                            augment_type = np.random.choice([
+                                'gaussian_noise', 'time_shift', 'amplitude_scaling'
+                            ])
+                            augmented_seg = self.data_augmentation(segments[i], augment_type)
+                            augmented_signals[signal_name].append(augmented_seg)
+                        else:
+                            augmented_signals[signal_name].append(segments[i])
+                
+                return augmented_signals
+            
+            # 不增强时返回原始分段
+            return {
+                'accelerometer_1': accelerometer_1_segments,
+                'microphone': microphone_segments,
+                'accelerometer_2': accelerometer_2_segments,
+                'accelerometer_3': accelerometer_3_segments,
+                'temperature': temperature_segments
+            }
+
+
+    def process_dataset(self, data_list, labels, metadata, apply_augmentation=False):
+        """处理整个数据集"""
+        print(f"\n开始数据预处理...")
+        print(f"数据增强: {'启用' if apply_augmentation else '禁用'}")
+        
+        processed_signals = {
+            'accelerometer_1': [],
+            'microphone': [],
+            'accelerometer_2': [],
+            'accelerometer_3': [],
+            'temperature': []
+        }
+        processed_labels = []
+        processed_metadata = []
+        
+        for i, (data, label, meta) in enumerate(zip(data_list, labels, metadata)):
+            if i % 10 == 0:
+                print(f"处理进度: {i}/{len(data_list)}")
+            
+            # 处理单个样本
+            processed_sample = self.process_sample(data, apply_augmentation)
+            
+            # 添加到结果列表  
+            for j in range(len(processed_sample['accelerometer_1'])):  
+                processed_signals['accelerometer_1'].append(processed_sample['accelerometer_1'][j])  
+                processed_signals['microphone'].append(processed_sample['microphone'][j])  
+                processed_signals['accelerometer_2'].append(processed_sample['accelerometer_2'][j])  
+                processed_signals['accelerometer_3'].append(processed_sample['accelerometer_3'][j])  
+                processed_signals['temperature'].append(processed_sample['temperature'][j])  
+                processed_labels.append(label)  
+                processed_metadata.append(meta)  
+        
+        print(f"数据预处理完成!")  
+        print(f"处理后样本数: {len(processed_signals['accelerometer_1'])}")  
+        
+        return (  
+            processed_signals['accelerometer_1'],  # 振动信号1   
+            processed_signals['microphone'],    # 声学信号   
+            processed_signals['accelerometer_2'],   # 振动信号2   
+            processed_signals['accelerometer_3'],   # 振动信号3   
+            processed_signals['temperature'],   # 温度信号    
+            processed_labels,   
+            processed_metadata  
+        )  
+
+
+# 使用示例
+if __name__ == "__main__":
+    from configs.config import Config, config
+    from data.university_of_ottawa_loader import UniversityOfOttawaDataLoader
+
+    # 数据集根目录 - 请根据您的实际路径修改
+    DATA_ROOT = r"E:\20250711电机小论文\data"
+
+    # 检查数据目录是否存在
+    if not os.path.exists(DATA_ROOT):
+        print(f"错误: 数据目录 {DATA_ROOT} 不存在!")
+        print("请检查数据目录路径")
+        exit(1)
+
+    # 初始化数据加载器
+    data_loader = UniversityOfOttawaDataLoader(DATA_ROOT, config)
+
+    # 加载数据集
+    try:
+        data_list, labels, metadata = data_loader.load_dataset(
+            use_csv=True,  # 使用CSV文件
+            conditions=[0, 1]  # 加载空载和负载工况
+        )
+
+        # 初始化预处理器
+        preprocessor = DataPreprocessor(config)
+
+        # 处理数据集
+       # 处理数据集
+        processed_vibration_1, processed_microphone, processed_vibration_2, processed_vibration_3, processed_temperature, processed_labels, processed_metadata = preprocessor.process_dataset(  
+        data_list, labels, metadata, apply_augmentation=True  
+)  
+
+        print(f"\n数据预处理统计:")
+        print(f"振动信号1形状: {np.array(processed_vibration_1).shape}")
+        print(f"声学信号形状: {np.array(processed_microphone).shape}")
+        print(f"振动信号2形状: {np.array(processed_vibration_2).shape}")
+        print(f"振动信号3形状: {np.array(processed_vibration_3).shape}")
+        print(f"温度信号形状: {np.array(processed_temperature).shape}")
+        print(f"标签数量: {len(processed_labels)}")
+
+
+        # 显示数据分布
+        unique_labels, label_counts = np.unique(processed_labels, return_counts=True)
+        print(f"\n处理后数据分布:")
+        for label, count in zip(unique_labels, label_counts):
+            fault_name = data_loader.fault_names[label]
+            print(f"  {fault_name}: {count} 个样本")
+
+    except Exception as e:
+        print(f"数据加载失败: {e}")
+        print("请检查数据目录路径和文件格式")

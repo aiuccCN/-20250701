@@ -1,0 +1,152 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, classification_report
+from utils.early_stopping import EarlyStoppingCallback
+import seaborn as sns
+import sys
+sys.path.append(r'E:\20250711电机小论文')
+from configs.config import config, Config
+
+def train_model(model, train_loader, val_loader, config, device):
+    """
+    通用模型训练函数
+    
+    Args:
+        model (nn.Module): 要训练的模型
+        train_loader (DataLoader): 训练数据加载器
+        val_loader (DataLoader): 验证数据加载器
+        config (Config): 配置对象
+        device (torch.device): 计算设备
+    
+    Returns:
+        tuple: 训练损失、验证准确率和最佳验证准确率
+    """
+    # 优化器
+    optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE, weight_decay=1e-4)
+
+    # 学习率调度器
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=10
+    )
+
+    # 早停
+    early_stopping = EarlyStoppingCallback(patience=config.PATIENCE)
+
+    # 损失函数
+    criterion = nn.CrossEntropyLoss()
+
+    # 记录训练过程
+    train_losses = []
+    val_accuracies = []
+
+    print(f"\n开始训练模型...")
+    print(f"训练集大小: {len(train_loader.dataset)}")
+    print(f"验证集大小: {len(val_loader.dataset)}")
+
+    best_val_acc = 0.0
+
+    for epoch in range(config.NUM_EPOCHS):
+        # 训练阶段
+        model.train()
+        train_loss = 0.0
+        train_correct = 0
+        train_total = 0
+        
+        for batch_idx, batch in enumerate(train_loader):
+            acoustic_data = batch['acoustic'].to(device)
+            vibration_data = batch['vibration'].to(device)
+            labels = batch['label'].to(device)
+            
+            optimizer.zero_grad()
+            
+            # 前向传播
+            logits, losses = model(acoustic_data, vibration_data, labels)
+            
+            # 计算总损失
+            classification_loss = criterion(logits, labels)
+            
+            # 物理约束损失
+            physics_loss = (
+                losses.get('pi_kl_loss', 0) * config.ALPHA +
+                losses.get('pi_physics_loss', 0) * config.BETA +
+                losses.get('pi_causality_loss', 0) * config.GAMMA +
+                losses.get('mlwcn_orthogonal_loss', 0) * 0.1 +
+                losses.get('mlwcn_adaptive_loss', 0) * 0.01 +
+                losses.get('mlwcn_multiscale_loss', 0) * 0.1
+            )
+            
+            total_loss = classification_loss + physics_loss
+            
+            # 反向传播
+            total_loss.backward()
+            
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            
+            # 统计
+            train_loss += total_loss.item()
+            _, predicted = logits.max(1)
+            train_total += labels.size(0)
+            train_correct += predicted.eq(labels).sum().item()
+            
+            if batch_idx % 50 == 0:
+                print(f'Epoch [{epoch+1}/{config.NUM_EPOCHS}], '
+                      f'Batch [{batch_idx}/{len(train_loader)}], '
+                      f'Loss: {total_loss.item():.4f}, '
+                      f'Acc: {100.0 * train_correct / train_total:.2f}%')
+        
+        # 验证阶段
+        model.eval()
+        val_correct = 0
+        val_total = 0
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                acoustic_data = batch['acoustic'].to(device)
+                vibration_data = batch['vibration'].to(device)
+                labels = batch['label'].to(device)
+                
+                logits, _ = model(acoustic_data, vibration_data, labels)
+                _, predicted = logits.max(1)
+                val_total += labels.size(0)
+                val_correct += predicted.eq(labels).sum().item()
+        
+        # 计算指标
+        train_acc = 100.0 * train_correct / train_total
+        val_acc = 100.0 * val_correct / val_total
+        avg_train_loss = train_loss / len(train_loader)
+        
+        train_losses.append(avg_train_loss)
+        val_accuracies.append(val_acc)
+        
+        print(f'Epoch [{epoch+1}/{config.NUM_EPOCHS}]: '
+              f'Train Loss: {avg_train_loss:.4f}, '
+              f'Train Acc: {train_acc:.2f}%, '
+              f'Val Acc: {val_acc:.2f}%')
+        
+        # 更新学习率
+        old_lr = optimizer.param_groups[0]['lr']
+        scheduler.step(val_acc)
+        new_lr = optimizer.param_groups[0]['lr']
+        
+        if new_lr != old_lr:
+            print(f'学习率从 {old_lr:.6f} 调整为 {new_lr:.6f}')
+        
+        # 保存最佳模型
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(model.state_dict(), 'best_model.pth')
+            print(f'新的最佳模型已保存 (Val Acc: {val_acc:.2f}%)')
+        
+        # 早停检查
+        if early_stopping(val_acc):
+            print(f'早停触发，停止训练')
+            break
+
+    return train_losses, val_accuracies, best_val_acc
